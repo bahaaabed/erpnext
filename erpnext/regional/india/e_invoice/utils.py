@@ -56,6 +56,9 @@ def validate_eligibility(doc):
 		return False
 
 	invalid_company = not frappe.db.get_value("E Invoice User", {"company": doc.get("company")})
+	invalid_company_gstin = not frappe.db.get_value(
+		"E Invoice User", {"gstin": doc.get("company_gstin")}
+	)
 	invalid_supply_type = doc.get("gst_category") not in [
 		"Registered Regular",
 		"Registered Composition",
@@ -72,6 +75,7 @@ def validate_eligibility(doc):
 
 	if (
 		invalid_company
+		or invalid_company_gstin
 		or invalid_supply_type
 		or company_transaction
 		or no_taxes_applied
@@ -268,14 +272,45 @@ def get_item_list(invoice):
 		item.description = sanitize_for_json(d.item_name)
 
 		item.qty = abs(item.qty)
-		if flt(item.qty) != 0.0:
-			item.unit_rate = abs(item.taxable_value / item.qty)
-		else:
-			item.unit_rate = abs(item.taxable_value)
-		item.gross_amount = abs(item.taxable_value)
-		item.taxable_value = abs(item.taxable_value)
-		item.discount_amount = 0
 
+		hide_discount_in_einvoice = cint(
+			frappe.db.get_single_value("E Invoice Settings", "dont_show_discounts_in_e_invoice")
+		)
+
+		if hide_discount_in_einvoice:
+			if flt(item.qty) != 0.0:
+				item.unit_rate = abs(item.taxable_value / item.qty)
+			else:
+				item.unit_rate = abs(item.taxable_value)
+			item.gross_amount = abs(item.taxable_value)
+			item.taxable_value = abs(item.taxable_value)
+			item.discount_amount = 0
+
+		else:
+			if invoice.get("apply_discount_on") and (abs(invoice.get("base_discount_amount") or 0.0) > 0.0):
+				# TODO: need to handle case when tax included in basic rate is checked.
+				item.discount_amount = (item.discount_amount * item.qty) + (
+					abs(item.base_amount) - abs(item.base_net_amount)
+				)
+			else:
+				item.discount_amount = item.discount_amount * item.qty
+
+			if invoice.get("is_return") or invoice.get("is_debit_note"):
+				item.unit_rate = (abs(item.taxable_value) + item.discount_amount) / (
+					1 if (item.qty == 0) else item.qty
+				)
+			else:
+				try:
+					item.unit_rate = abs(item.taxable_value + item.discount_amount) / item.qty
+				except ZeroDivisionError:
+					# This will never run but added as safety measure
+					frappe.throw(
+						title=_("Error: Qty is Zero"),
+						msg=_("Quantity can't be zero unless it's Credit/Debit Note."),
+					)
+
+		item.gross_amount = abs(item.taxable_value) + item.discount_amount
+		item.taxable_value = abs(item.taxable_value)
 		item.is_service_item = "Y" if item.gst_hsn_code and item.gst_hsn_code[:2] == "99" else "N"
 		item.serial_no = ""
 
@@ -349,7 +384,14 @@ def update_item_taxes(invoice, item):
 def get_invoice_value_details(invoice):
 	invoice_value_details = frappe._dict(dict())
 	invoice_value_details.base_total = abs(sum([i.taxable_value for i in invoice.get("items")]))
-	invoice_value_details.invoice_discount_amt = 0
+	if (
+		invoice.apply_discount_on == "Grand Total"
+		and invoice.discount_amount
+		and invoice.get("is_cash_or_non_trade_discount")
+	):
+		invoice_value_details.invoice_discount_amt = invoice.discount_amount
+	else:
+		invoice_value_details.invoice_discount_amt = 0
 
 	invoice_value_details.round_off = invoice.base_rounding_adjustment
 	invoice_value_details.base_grand_total = abs(invoice.base_rounded_total) or abs(
@@ -802,6 +844,8 @@ class GSPConnector:
 		self.gstin_details_url = self.base_url + "/enriched/ei/api/master/gstin"
 		# cancel_ewaybill_url will only work if user have bought ewb api from adaequare.
 		self.cancel_ewaybill_url = self.base_url + "/enriched/ewb/ewayapi?action=CANEWB"
+		# ewaybill_details_url + ?irn={irn_number} will provide eway bill number and details.
+		self.ewaybill_details_url = self.base_url + "/enriched/ei/api/ewaybill/irn"
 		self.generate_ewaybill_url = self.base_url + "/enriched/ei/api/ewaybill"
 		self.get_qrcode_url = self.base_url + "/enriched/ei/others/qr/image"
 
@@ -1204,23 +1248,22 @@ class GSPConnector:
 			log_error(data)
 			self.raise_error(True)
 
-	def cancel_eway_bill(self, eway_bill, reason, remark):
+	def get_ewb_details(self):
+		"""
+		Get e-Waybill Details by IRN API documentaion for validation is not added yet.
+		https://einv-apisandbox.nic.in/version1.03/get-ewaybill-details-by-irn.html#validations
+		NOTE: if ewaybill Validity period lapsed or scanned by officer enroute (not tested yet) it will still return status as "ACT".
+		"""
 		headers = self.get_headers()
-		data = json.dumps({"ewbNo": eway_bill, "cancelRsnCode": reason, "cancelRmrk": remark}, indent=4)
-		headers["username"] = headers["user_name"]
-		del headers["user_name"]
-		try:
-			res = self.make_request("post", self.cancel_ewaybill_url, headers, data)
-			if res.get("success"):
-				self.invoice.ewaybill = ""
-				self.invoice.eway_bill_cancelled = 1
-				self.invoice.flags.updater_reference = {
-					"doctype": self.invoice.doctype,
-					"docname": self.invoice.name,
-					"label": _("E-Way Bill Cancelled - {}").format(remark),
-				}
-				self.update_invoice()
+		irn = self.invoice.irn
+		if not irn:
+			frappe.throw(_("IRN is mandatory to get E-Waybill Details. Please generate IRN first."))
 
+		try:
+			params = "?irn={irn}".format(irn=irn)
+			res = self.make_request("get", self.ewaybill_details_url + params, headers)
+			if res.get("success"):
+				return res.get("result")
 			else:
 				raise RequestFailed
 
@@ -1229,8 +1272,64 @@ class GSPConnector:
 			self.raise_error(errors=errors)
 
 		except Exception:
-			log_error(data)
+			log_error()
 			self.raise_error(True)
+
+	def update_ewb_details(self, ewb_details=None):
+		# for any reason user chooses to generate eway bill using portal this will allow to update ewaybill details in the invoice.
+		if not self.invoice.irn:
+			frappe.throw(_("IRN is mandatory to update E-Waybill Details. Please generate IRN first."))
+		if not ewb_details:
+			ewb_details = self.get_ewb_details()
+		if ewb_details:
+			self.invoice.ewaybill = ewb_details.get("EwbNo")
+			self.invoice.eway_bill_validity = ewb_details.get("EwbValidTill")
+			self.invoice.eway_bill_cancelled = 0 if ewb_details.get("Status") == "ACT" else 1
+			self.update_invoice()
+
+	def cancel_eway_bill(self):
+		ewb_details = self.get_ewb_details()
+		if ewb_details:
+			ewb_no = str(ewb_details.get("EwbNo"))
+			ewb_status = ewb_details.get("Status")
+			if ewb_status == "CNL":
+				self.invoice.ewaybill = ""
+				self.invoice.eway_bill_cancelled = 1
+				self.invoice.flags.updater_reference = {
+					"doctype": self.invoice.doctype,
+					"docname": self.invoice.name,
+					"label": _("E-Way Bill Cancelled"),
+				}
+				self.update_invoice()
+				frappe.msgprint(
+					_("E-Way Bill Cancelled successfully"),
+					indicator="green",
+					alert=True,
+				)
+			elif ewb_status == "ACT" and self.invoice.ewaybill == ewb_no:
+				msg = _("E-Way Bill {} is still active.").format(bold(ewb_no))
+				msg += "<br><br>"
+				msg += _(
+					"You must first use the portal to cancel the e-way bill and then update the cancelled status in the ERPNext system."
+				)
+				frappe.msgprint(msg)
+			elif ewb_status == "ACT" and self.invoice.ewaybill != ewb_no:
+				# if user cancelled the current eway bill and generated new eway bill using portal, then this will update new ewb number in sales invoice.
+				msg = _("E-Way Bill No. {0} doesn't match {1} saved in the invoice.").format(
+					bold(ewb_no), bold(self.invoice.ewaybill)
+				)
+				msg += "<hr/>"
+				msg += _("E-Way Bill No. {} is updated in the invoice.").format(bold(ewb_no))
+				frappe.msgprint(msg)
+				self.update_ewb_details(ewb_details=ewb_details)
+			else:
+				# this block should not be ever called but added incase there is any change in API.
+				msg = _("Unknown E-Way Status Code {}.").format(ewb_status)
+				msg += "<br><br>"
+				msg += _("Please contact your system administrator.")
+				frappe.throw(msg)
+		else:
+			frappe.msgprint(_("E-Way Bill Details not found for this IRN."))
 
 	def sanitize_error_message(self, message):
 		"""
@@ -1382,12 +1481,22 @@ def generate_eway_bill(doctype, docname, **kwargs):
 
 @frappe.whitelist()
 def cancel_eway_bill(doctype, docname):
-	# NOTE: cancel_eway_bill api is disabled by Adequare.
-	# gsp_connector = GSPConnector(doctype, docname)
-	# gsp_connector.cancel_eway_bill(eway_bill, reason, remark)
+	# NOTE: cancel_eway_bill api is disabled by NIC for E-invoice so this will only check if eway bill is canceled or not and update accordingly.
+	# https://einv-apisandbox.nic.in/version1.03/cancel-eway-bill.html#
+	gsp_connector = GSPConnector(doctype, docname)
+	gsp_connector.cancel_eway_bill()
 
-	frappe.db.set_value(doctype, docname, "ewaybill", "")
-	frappe.db.set_value(doctype, docname, "eway_bill_cancelled", 1)
+
+@frappe.whitelist()
+def get_ewb_details(doctype, docname):
+	gsp_connector = GSPConnector(doctype, docname)
+	gsp_connector.get_ewb_details()
+
+
+@frappe.whitelist()
+def update_ewb_details(doctype, docname):
+	gsp_connector = GSPConnector(doctype, docname)
+	gsp_connector.update_ewb_details()
 
 
 @frappe.whitelist()
