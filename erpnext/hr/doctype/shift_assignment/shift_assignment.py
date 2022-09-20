@@ -93,12 +93,12 @@ class ShiftAssignment(Document):
 			)
 			frappe.throw(msg, title=_("Overlapping Shifts"), exc=OverlappingShiftError)
 
-def check_same_days(a, b):
-    a_set = set(a)
-    b_set = set(b)
-    if len(a_set.intersection(b_set)) > 0:
-        return(True) 
-    return(False)  
+# def check_same_days(a, b):
+#     a_set = set(a)
+#     b_set = set(b)
+#     if len(a_set.intersection(b_set)) > 0:
+#         return(True) 
+#     return(False)  
 
 def has_overlapping_timings(shift_1: str, shift_2: str) -> bool:
 	"""
@@ -115,22 +115,22 @@ def has_overlapping_timings(shift_1: str, shift_2: str) -> bool:
 	for i,j in zip(list_shift1,list_shift2):
 		days_shift1.append(i.day)
 		days_shift2.append(j.day)
-	check_same_days(days_shift1, days_shift2)
+	# check_same_days(days_shift1, days_shift2)
 	if (
 		(
 			curr_shift.start_time > overlapping_shift.start_time
 			and curr_shift.start_time < overlapping_shift.end_time
-			and check_same_days(days_shift1, days_shift2)
+			# and check_same_days(days_shift1, days_shift2)
 		)
 		or (
 			curr_shift.end_time > overlapping_shift.start_time
 			and curr_shift.end_time < overlapping_shift.end_time
-			and check_same_days(days_shift1, days_shift2)
+			# and check_same_days(days_shift1, days_shift2)
 		)
 		or (
 			curr_shift.start_time <= overlapping_shift.start_time
 			and curr_shift.end_time >= overlapping_shift.end_time
-			and check_same_days(days_shift1, days_shift2)
+			# and check_same_days(days_shift1, days_shift2)
 		)
 	):
 		return True

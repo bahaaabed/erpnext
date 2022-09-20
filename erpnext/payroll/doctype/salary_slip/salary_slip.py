@@ -315,6 +315,41 @@ class SalarySlip(TransactionBase):
 			"Payroll Settings", "include_holidays_in_total_working_days"
 		)
 
+		employee_shifts = frappe.get_list("Shift Assignment",filters={'employee': self.employee})
+		shift_days = []
+		import collections
+		diff_days = []
+		from collections import Counter
+		if len(employee_shifts) > 1:
+			for i in employee_shifts:
+				shift_assignemnt =frappe.get_doc("Shift Assignment",i.name)
+				shift_type = frappe.get_doc("Shift Type", shift_assignemnt.shift_type)
+				days = shift_type.days
+				for i in days:
+					shift_days.append(i.day)
+		diff_list = Counter(shift_days)
+		diff_days = [k for k,v in diff_list.items() if v == 1 ]
+		count_same_days = [item for item, count in collections.Counter(shift_days).items() if count > 1]
+		count = 0
+
+		import datetime, calendar
+		currentDate = datetime.date.today()
+		daysInMonth= calendar.monthrange(currentDate.year, currentDate.month)[1]
+		days = []
+		for i in range(1, daysInMonth+1):
+			day = datetime.datetime(currentDate.year, currentDate.month, i)
+			days.append(calendar.day_name[day.weekday()])
+
+		for x in count_same_days:
+			count += days.count(x)
+		work_shifts = (count + len(diff_days)) * len(employee_shifts)
+		holidays = self.get_holidays_for_employee(self.start_date, self.end_date)
+		number_of_holiday_shift = frappe.db.get_single_value(
+			"Payroll Settings", "number_of_holiday_shift"
+		)
+		if cint(include_holidays_in_total_working_days):
+			work_shifts += (len(holidays) * number_of_holiday_shift)
+
 		working_days = date_diff(self.end_date, self.start_date) + 1
 		if for_preview:
 			self.total_working_days = working_days
